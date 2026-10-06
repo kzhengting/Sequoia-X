@@ -7,6 +7,7 @@
 ## 简介 | Introduction
 
 Sequoia-X V2 是面向 A 股市场的量化选股系统，基于现代 Python 工程化标准从零重构。
+
 系统以 OOP 架构、向量化计算和增量数据更新为核心设计原则，每日收盘后自动选股并推送至飞书群。
 
 数据层使用 [baostock](http://baostock.com)（免费、无需注册、无限流）拉取历史及增量日 K 数据（后复权），
@@ -76,7 +77,7 @@ python main.py
 建议配合 crontab 每个交易日收盘后自动执行：
 
 ```cron
-15 19 * * 1-5 cd /root/Sequoia-X && .venv/bin/python main.py >> log.txt 2>&1
+15 20 * * 1-5 cd /root/Sequoia-X && .venv/bin/python main.py >> log.txt 2>&1
 ```
 
 ---
