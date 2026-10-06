@@ -8,6 +8,7 @@ import requests
 from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
 
+
 logger = get_logger(__name__)
 
 
@@ -19,6 +20,17 @@ class FeishuNotifier:
     则 fallback 到 Settings.feishu_webhook_url。
     """
 
+    # 策略类型 -> 类型备注（选股逻辑说明），用于在飞书卡片中标注本次选出的类型。
+    STRATEGY_REMARKS: dict[str, str] = {
+        "TurtleTradeStrategy": "海龟突破：20日新高 + 成交额过亿 + 阳线防诱多，按涨幅排序",
+        "MaVolumeStrategy": "均线+放量突破",
+        "HighTightFlagStrategy": "高而窄的旗形整理突破",
+        "LimitUpShakeoutStrategy": "涨停洗盘回踩确认",
+        "UptrendLimitDownStrategy": "上升趋势中的跌停反包",
+        "RpsBreakoutStrategy": "欧奈尔 RPS 相对强度突破",
+        "PrivatePlacementStrategy": "定向增发事件驱动",
+    }
+
     def __init__(self, settings: Settings) -> None:
         """
         初始化 FeishuNotifier。
@@ -27,6 +39,19 @@ class FeishuNotifier:
             settings: Settings 实例，提供 Webhook URL 配置。
         """
         self.settings = settings
+
+    @classmethod
+    def _strategy_remark(cls, strategy_name: str) -> str:
+        """返回策略类型对应的说明备注，兼容是否带 "Strategy" 后缀的写法。"""
+        if strategy_name in cls.STRATEGY_REMARKS:
+            return cls.STRATEGY_REMARKS[strategy_name]
+
+        bare = strategy_name[:-8] if strategy_name.endswith("Strategy") else strategy_name
+        for key, remark in cls.STRATEGY_REMARKS.items():
+            bare_key = key[:-8] if key.endswith("Strategy") else key
+            if bare_key == bare:
+                return remark
+        return "未收录策略类型"
 
     @staticmethod
     def _to_xueqiu_code(code: str) -> str:
@@ -41,6 +66,7 @@ class FeishuNotifier:
     def _get_stock_names(symbols: list[str]) -> dict[str, str]:
         """通过 baostock 批量查询股票名称，返回 {code: name} 映射。"""
         import baostock as bs
+
         bs.login()
         mapping = {}
         for code in symbols:
@@ -55,6 +81,7 @@ class FeishuNotifier:
     def _build_card(self, symbols: list[str], strategy_name: str) -> dict:
         today = date.today().strftime("%Y-%m-%d")
         names = self._get_stock_names(symbols)
+        remark = self._strategy_remark(strategy_name)
 
         links: list[str] = []
         for code in symbols:
@@ -79,7 +106,7 @@ class FeishuNotifier:
                         "tag": "div",
                         "text": {
                             "tag": "lark_md",
-                            "content": f"**日期：** {today}\n**策略：** {strategy_name}\n**选股数量：** {len(symbols)}",
+                            "content": f"**日期：** {today}\n**策略：** {strategy_name}\n**类型备注：** {remark}\n**选股数量：** {len(symbols)}",
                         },
                     },
                     {"tag": "hr"},
