@@ -24,43 +24,33 @@ class TurtleTradeStrategy(BaseStrategy):
     _MIN_BARS: int = 21  # 至少需要 21 根 K 线（20日窗口 + 当日）
 
     def _get_market_caps(self, symbols: list[str]) -> dict[str, float]:
-        """通过 baostock 查询候选股票的流通市值（不复权收盘价 × 流通股本）。
+        """通过 AkShare（新浪源，不复权）查询候选股票的流通市值。
 
-        流通股本 = 成交量 / (换手率% / 100)
-        流通市值 = 流通股本 × 不复权收盘价
+        流通市值 = 不复权收盘价 × 流通股本（outstanding_share，单位：股）
         """
-        from datetime import date
+        from datetime import date, timedelta
 
-        import baostock as bs
+        from sequoia_x.data.engine import _fetch_daily, _to_ak_symbol
 
-        today_str = date.today().strftime("%Y-%m-%d")
+        end = date.today().strftime("%Y-%m-%d")
+        start = (date.today() - timedelta(days=45)).strftime("%Y-%m-%d")
         market_caps: dict[str, float] = {}
 
-        bs.login()
-        try:
-            for symbol in symbols:
-                bs_code = self.engine._to_baostock_code(symbol)
-                rs = bs.query_history_k_data_plus(
-                    bs_code,
-                    "close,volume,turn",
-                    start_date=today_str,
-                    end_date=today_str,
-                    frequency="d",
-                    adjustflag="3",  # 不复权，真实价格
-                )
-                while rs.next():
-                    row = rs.get_row_data()
-                    try:
-                        close = float(row[0])
-                        volume = float(row[1])
-                        turn = float(row[2])
-                        if turn > 0:
-                            circulating_shares = volume / (turn / 100)
-                            market_caps[symbol] = circulating_shares * close
-                    except (ValueError, ZeroDivisionError):
-                        continue
-        finally:
-            bs.logout()
+        for symbol in symbols:
+            try:
+                df = _fetch_daily(_to_ak_symbol(symbol), start, end, "", retries=2)
+            except Exception:  # noqa: BLE001
+                continue
+            if df is None or df.empty:
+                continue
+            last = df.iloc[-1]
+            try:
+                close = float(last["close"])
+                shares = float(last.get("outstanding_share", 0) or 0)
+            except (ValueError, TypeError):
+                continue
+            if shares > 0:
+                market_caps[symbol] = shares * close
 
         return market_caps
 
