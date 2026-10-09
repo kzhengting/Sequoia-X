@@ -10,7 +10,7 @@ Sequoia-X V2 是面向 A 股市场的量化选股系统，基于现代 Python �
 
 系统以 OOP 架构、向量化计算和增量数据更新为核心设计原则，每日收盘后自动选股并推送至飞书群。
 
-数据层使用 [baostock](http://baostock.com)（免费、无需注册、无限流）拉取历史及增量日 K 数据（后复权），
+数据层使用 [AkShare](https://akshare.akfamily.xyz/)（新浪交易日线源，免费、无需注册）拉取历史及增量日 K 数据（后复权），
 存储于本地 SQLite，彻底规避东方财富反爬问题。
 
 ---
@@ -95,7 +95,7 @@ Sequoia-X/
 │   │   ├── config.py            # Pydantic-settings 配置管理
 │   │   └── logger.py            # rich 结构化日志
 │   ├── data/
-│   │   └── engine.py            # 数据引擎（baostock 回填 + 增量同步 + SQLite）
+│   │   └── engine.py            # 数据引擎（AkShare 回填 + 增量同步 + SQLite）
 │   ├── strategy/
 │   │   ├── base.py              # 策略抽象基类
 │   │   ├── turtle_trade.py      # 海龟交易策略
@@ -113,10 +113,10 @@ Sequoia-X/
 
 ## 数据说明
 
-- **数据源**：[baostock](http://baostock.com)（免费、无需注册、无限流）
+- **数据源**：[AkShare](https://akshare.akfamily.xyz/)（新浪日线源，免费、无需注册）
 - **复权方式**：后复权（hfq）— 历史价格不变，适合增量存储，避免除权导致数据错乱
 - **存储**：本地 SQLite（`data/sequoia_v2.db`），可直接拷贝到其他机器使用
-- **日常增量**：8 进程并行通过 baostock 拉取，2~3 分钟完成全市场更新
+- **日常增量**：8 进程并行通过 AkShare 拉取，2~3 分钟完成全市场更新
 
 ---
 
