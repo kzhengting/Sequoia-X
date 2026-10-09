@@ -234,67 +234,62 @@ class DataEngine:
         return count
 
     def backfill(self, symbols: list[str]) -> None:
-        """通过 AkShare 批量回填历史日 K 线数据（后复权）。
+        """通过 AkShare 多进程并行批量回填历史日 K 线数据（后复权）。
 
         容错机制：
-        - 单只股票失败自动重试 3 次，间隔递增（2s/4s）
+        - 多进程并行拉取（默认 8 进程），单只失败自动重试 3 次
         - 已入库的自动 skip，中断后可重跑续传
+        - 边拉边写：每个分片完成即落库，降低内存占用
         """
         from datetime import date, timedelta
+        from multiprocessing import Pool
 
         today_str = date.today().strftime("%Y-%m-%d")
 
-        success = 0
+        tasks = []
         skipped = 0
-        failed = 0
-
-        for i, symbol in enumerate(symbols):
+        for symbol in symbols:
             last_date = self._get_last_date(symbol)
             if last_date and last_date >= today_str:
                 skipped += 1
-                if (i + 1) % 500 == 0:
-                    logger.info(
-                        f"已处理 {i + 1}/{len(symbols)}，"
-                        f"成功 {success} 跳过 {skipped} 失败 {failed}"
-                    )
                 continue
-
             start = last_date or self.start_date
             if last_date:
                 start = (date.fromisoformat(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
+            tasks.append((symbol, _to_ak_symbol(symbol), start, today_str))
 
-            ak_symbol = _to_ak_symbol(symbol)
+        logger.info(
+            f"需回填 {len(tasks)} 只（已有数据跳过 {skipped} 只），启动多进程并行拉取..."
+        )
 
-            try:
-                raw = _fetch_daily(ak_symbol, start, today_str, "hfq", retries=3)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"[{symbol}] 拉取失败，跳过：{exc}")
-                failed += 1
-                continue
+        if not tasks:
+            logger.info("所有股票均已有最新数据，无需回填")
+            return
 
-            df = _normalize(raw, symbol)
-            if df.empty:
-                skipped += 1
-                continue
+        n_workers = min(8, len(tasks))
+        chunks = [tasks[i::n_workers] for i in range(n_workers)]
 
-            try:
+        n_rows = 0
+        n_syms = 0
+        with Pool(n_workers) as pool:
+            for frames in pool.imap_unordered(_ak_fetch_batch, chunks):
+                if not frames:
+                    continue
+                df = pd.concat(frames, ignore_index=True)
+                df = df.drop_duplicates(subset=["symbol", "date"])
                 with sqlite3.connect(self.db_path) as conn:
                     df.to_sql(
                         "stock_daily", conn, if_exists="append",
-                        index=False, method="multi", chunksize=500,
+                        index=False, method="multi", chunksize=1000,
                     )
-            except sqlite3.IntegrityError:
-                pass
+                    conn.commit()
+                n_rows += len(df)
+                n_syms += len(frames)
+                logger.info(f"回填进度 — 已获取 {n_syms} 只 / {n_rows} 行")
 
-            success += 1
-
-            if (i + 1) % 500 == 0:
-                logger.info(
-                    f"已处理 {i + 1}/{len(symbols)}，"
-                    f"成功 {success} 跳过 {skipped} 失败 {failed}"
-                )
-
-        logger.info(f"回填完成 — 成功: {success} | 跳过: {skipped} | 失败: {failed}")
+        logger.info(
+            f"回填完成 — 写入 {n_rows} 行，覆盖 {n_syms} 只（跳过 {skipped} 只）"
+        )
 
     # ── 股票列表 ──
 
