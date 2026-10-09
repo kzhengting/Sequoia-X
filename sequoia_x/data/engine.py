@@ -1,6 +1,10 @@
-"""数据引擎模块：负责 SQLite 行情数据存储与 baostock 增量同步。"""
+"""数据引擎模块：负责 SQLite 行情数据存储与 AkShare 增量同步。
+
+数据源：AkShare（新浪源 ``stock_zh_a_daily``），后复权（hfq）。
+"""
 
 import sqlite3
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -31,30 +35,106 @@ CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 """
 
 
-def _bs_fetch_batch(tasks: list) -> list:
-    """多进程 worker：独立 login，批量拉取 baostock 数据。"""
-    import baostock as bs
-    bs.login()
-    results = []
-    for symbol, bs_code, start, end in tasks:
-        rs = bs.query_history_k_data_plus(
-            bs_code,
-            "date,open,high,low,close,volume,amount",
-            start_date=start,
-            end_date=end,
-            frequency="d",
-            adjustflag="1",  # 后复权
-        )
-        if rs.error_code != "0":
+def _to_ak_symbol(symbol: str) -> str:
+    """将纯数字代码转为 AkShare（新浪）格式：6/9→sh，4/8→bj，其余→sz。"""
+    if symbol.startswith(("6", "9")):
+        prefix = "sh"
+    elif symbol.startswith(("4", "8")):
+        prefix = "bj"
+    else:
+        prefix = "sz"
+    return f"{prefix}{symbol}"
+
+
+def _fetch_daily(
+    ak_symbol: str,
+    start: str,
+    end: str,
+    adjust: str,
+    retries: int = 3,
+) -> pd.DataFrame:
+    """通过 AkShare（新浪源）拉取单只股票日 K 线，带指数退避重试。
+
+    Args:
+        ak_symbol: 带市场前缀的代码，如 ``sh600519``。
+        start: 起始日期 ``YYYY-MM-DD``。
+        end: 结束日期 ``YYYY-MM-DD``。
+        adjust: ``"hfq"``（后复权）/ ``""``（不复权）。
+        retries: 失败重试次数。
+
+    Returns:
+        原始 sina 日 K DataFrame；失败则抛出最后一次异常。
+    """
+    import akshare as ak
+
+    last_exc: Exception | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            df = ak.stock_zh_a_daily(
+                symbol=ak_symbol,
+                start_date=start.replace("-", ""),
+                end_date=end.replace("-", ""),
+                adjust=adjust,
+            )
+            return df if df is not None else pd.DataFrame()
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(2 ** (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+    return pd.DataFrame()
+
+
+def _normalize(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """把 sina 日 K 归一化为 stock_daily 契约。
+
+    契约列：``symbol, date, open, high, low, close, volume, turnover``。
+    ``turnover`` 列取 sina 的 ``amount``（成交额），与旧 baostock 口径一致。
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+    # sina 返回自带 turnover(换手率) 列，先丢弃避免与成交额重名
+    if "amount" in df.columns and "turnover" in df.columns:
+        df = df.drop(columns=["turnover"])
+    df = df.rename(columns={"amount": "turnover"})
+
+    keep = ["symbol", "date", "open", "high", "low", "close", "volume", "turnover"]
+    for col in ["open", "high", "low", "close", "volume", "turnover"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["close"])
+    if "volume" in df.columns:
+        df = df[df["volume"] > 0]
+
+    df["symbol"] = symbol
+    for col in keep:
+        if col not in df.columns:
+            df[col] = None
+    return df[keep]
+
+
+def _ak_fetch_batch(tasks: list) -> list:
+    """多进程 worker：批量拉取 AkShare 后复权日 K 数据。"""
+    frames = []
+    for symbol, ak_symbol, start, end in tasks:
+        try:
+            raw = _fetch_daily(ak_symbol, start, end, "hfq")
+            norm = _normalize(raw, symbol)
+            if not norm.empty:
+                frames.append(norm)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[{symbol}] 拉取失败: {exc}")
             continue
-        while rs.next():
-            results.append([symbol] + rs.get_row_data())
-    bs.logout()
-    return results
+    return frames
 
 
 class DataEngine:
-    """行情数据引擎，负责 SQLite 存储和 baostock 数据同步。"""
+    """行情数据引擎，负责 SQLite 存储和 AkShare 数据同步。"""
 
     def __init__(self, settings: Settings) -> None:
         self.db_path: str = settings.db_path
@@ -87,21 +167,22 @@ class DataEngine:
         return df
 
     @staticmethod
-    def _to_baostock_code(symbol: str) -> str:
-        """将纯数字代码转为 baostock 格式：6/9开头 -> sh，其余 -> sz。"""
-        prefix = "sh" if symbol.startswith(("6", "9")) else "sz"
-        return f"{prefix}.{symbol}"
+    def _to_ak_symbol(symbol: str) -> str:
+        """将纯数字代码转为 AkShare（新浪）格式：6/9→sh，4/8→bj，其余→sz。"""
+        return _to_ak_symbol(symbol)
+
+    # 向后兼容旧命名（baostock 时代遗留）
+    _to_baostock_code = _to_ak_symbol
 
     # ── 数据同步 ──
 
     def sync_today_bulk(self) -> int:
-        """多进程并行通过 baostock 拉取增量数据（后复权），写入 SQLite。"""
+        """多进程并行通过 AkShare 拉取增量数据（后复权），写入 SQLite。"""
         from datetime import date, timedelta
         from multiprocessing import Pool
 
         today_str = date.today().strftime("%Y-%m-%d")
 
-        tasks = []
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(
                 "SELECT symbol, MAX(date) FROM stock_daily GROUP BY symbol"
@@ -111,13 +192,14 @@ class DataEngine:
             logger.warning("本地无股票数据，请先执行 --backfill")
             return 0
 
+        tasks = []
         for symbol, last_date in rows:
             if last_date and last_date >= today_str:
                 continue
             start = today_str
             if last_date:
                 start = (date.fromisoformat(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
-            tasks.append((symbol, self._to_baostock_code(symbol), start, today_str))
+            tasks.append((symbol, _to_ak_symbol(symbol), start, today_str))
 
         if not tasks:
             logger.info("所有股票已是最新，无需更新")
@@ -129,201 +211,105 @@ class DataEngine:
         chunks = [tasks[i::n_workers] for i in range(n_workers)]
 
         with Pool(n_workers) as pool:
-            batch_results = pool.map(_bs_fetch_batch, chunks)
+            batch_results = pool.map(_ak_fetch_batch, chunks)
 
-        all_rows = []
-        for batch in batch_results:
-            all_rows.extend(batch)
+        frames = [frame for batch in batch_results for frame in batch]
 
-        if not all_rows:
+        if not frames:
             logger.info("无新数据（可能非交易日）")
             return 0
 
-        df = pd.DataFrame(all_rows, columns=["symbol", "date", "open", "high", "low", "close", "volume", "turnover"])
-        for col in ["open", "high", "low", "close", "volume", "turnover"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["close"])
-        df = df[df["volume"] > 0]
-
+        df = pd.concat(frames, ignore_index=True)
         count = len(df)
         with sqlite3.connect(self.db_path) as conn:
             for d in df["date"].unique().tolist():
                 conn.execute("DELETE FROM stock_daily WHERE date = ?", (d,))
-            df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi", chunksize=500)
+            df.to_sql(
+                "stock_daily", conn, if_exists="append",
+                index=False, method="multi", chunksize=500,
+            )
             conn.commit()
 
         logger.info(f"sync_today_bulk: 写入 {count} 条数据")
         return count
 
     def backfill(self, symbols: list[str]) -> None:
-        """通过 baostock 批量回填历史日 K 线数据（后复权）。
+        """通过 AkShare 批量回填历史日 K 线数据（后复权）。
 
         容错机制：
-        - 单只股票失败自动重试 3 次，间隔递增（2s/4s/8s）
-        - 每 200 只股票自动重连 baostock（防止长连接超时）
+        - 单只股票失败自动重试 3 次，间隔递增（2s/4s）
         - 已入库的自动 skip，中断后可重跑续传
         """
-        import time
         from datetime import date, timedelta
 
-        import baostock as bs
-
         today_str = date.today().strftime("%Y-%m-%d")
-        max_retries = 3
-        reconnect_interval = 200  # 每处理 N 只股票重连一次
-
-        def _login():
-            lg = bs.login()
-            if lg.error_code != "0":
-                logger.error(f"baostock 登录失败: {lg.error_msg}")
-                return False
-            return True
-
-        if not _login():
-            return
 
         success = 0
         skipped = 0
         failed = 0
-        since_reconnect = 0
 
-        try:
-            for i, symbol in enumerate(symbols):
-                last_date = self._get_last_date(symbol)
-                if last_date and last_date >= today_str:
-                    skipped += 1
-                    if (i + 1) % 500 == 0:
-                        logger.info(
-                            f"已处理 {i + 1}/{len(symbols)}，"
-                            f"成功 {success} 跳过 {skipped} 失败 {failed}"
-                        )
-                    continue
-
-                # 定期重连，防止长连接超时
-                since_reconnect += 1
-                if since_reconnect >= reconnect_interval:
-                    bs.logout()
-                    time.sleep(1)
-                    if not _login():
-                        logger.error("重连失败，终止回填")
-                        return
-                    since_reconnect = 0
-
-                start = last_date or self.start_date
-                if last_date:
-                    start = (date.fromisoformat(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
-
-                bs_code = self._to_baostock_code(symbol)
-
-                # 带重试的查询
-                rows = []
-                query_ok = False
-                for attempt in range(max_retries):
-                    try:
-                        rs = bs.query_history_k_data_plus(
-                            bs_code,
-                            "date,open,high,low,close,volume,amount",
-                            start_date=start,
-                            end_date=today_str,
-                            frequency="d",
-                            adjustflag="1",  # 后复权
-                        )
-
-                        if rs.error_code != "0":
-                            raise RuntimeError(rs.error_msg)
-
-                        rows = []
-                        while rs.next():
-                            rows.append(rs.get_row_data())
-                        query_ok = True
-                        break
-
-                    except Exception as exc:
-                        if attempt < max_retries - 1:
-                            wait = 2 ** (attempt + 1)
-                            logger.warning(
-                                f"[{symbol}] 第{attempt + 1}次失败: {exc}，{wait}s 后重试"
-                            )
-                            time.sleep(wait)
-                            # 重连 baostock
-                            bs.logout()
-                            time.sleep(1)
-                            _login()
-                        else:
-                            logger.warning(f"[{symbol}] {max_retries}次重试均失败，跳过")
-
-                if not query_ok:
-                    failed += 1
-                    continue
-
-                if not rows:
-                    skipped += 1
-                    continue
-
-                df = pd.DataFrame(rows, columns=rs.fields)
-                for col in ["open", "high", "low", "close", "volume", "amount"]:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-                df = df.dropna(subset=["close"])
-                df = df[df["volume"] > 0]
-
-                if df.empty:
-                    skipped += 1
-                    continue
-
-                df["symbol"] = symbol
-                df = df.rename(columns={"amount": "turnover"})
-                df = df[["symbol", "date", "open", "high", "low", "close", "volume", "turnover"]]
-
-                try:
-                    with sqlite3.connect(self.db_path) as conn:
-                        df.to_sql(
-                            "stock_daily", conn, if_exists="append",
-                            index=False, method="multi", chunksize=500,
-                        )
-                except sqlite3.IntegrityError:
-                    pass
-
-                success += 1
-
+        for i, symbol in enumerate(symbols):
+            last_date = self._get_last_date(symbol)
+            if last_date and last_date >= today_str:
+                skipped += 1
                 if (i + 1) % 500 == 0:
                     logger.info(
                         f"已处理 {i + 1}/{len(symbols)}，"
                         f"成功 {success} 跳过 {skipped} 失败 {failed}"
                     )
+                continue
 
-        finally:
-            bs.logout()
+            start = last_date or self.start_date
+            if last_date:
+                start = (date.fromisoformat(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
+
+            ak_symbol = _to_ak_symbol(symbol)
+
+            try:
+                raw = _fetch_daily(ak_symbol, start, today_str, "hfq", retries=3)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[{symbol}] 拉取失败，跳过：{exc}")
+                failed += 1
+                continue
+
+            df = _normalize(raw, symbol)
+            if df.empty:
+                skipped += 1
+                continue
+
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    df.to_sql(
+                        "stock_daily", conn, if_exists="append",
+                        index=False, method="multi", chunksize=500,
+                    )
+            except sqlite3.IntegrityError:
+                pass
+
+            success += 1
+
+            if (i + 1) % 500 == 0:
+                logger.info(
+                    f"已处理 {i + 1}/{len(symbols)}，"
+                    f"成功 {success} 跳过 {skipped} 失败 {failed}"
+                )
 
         logger.info(f"回填完成 — 成功: {success} | 跳过: {skipped} | 失败: {failed}")
 
     # ── 股票列表 ──
 
     def get_all_symbols(self) -> list[str]:
-        """通过 baostock 获取全市场 A 股代码列表。"""
-        import baostock as bs
-
-        lg = bs.login()
-        if lg.error_code != "0":
-            logger.error(f"baostock 登录失败: {lg.error_msg}")
-            return []
+        """通过 AkShare 获取全市场 A 股代码列表。"""
+        import akshare as ak
 
         try:
-            rs = bs.query_stock_basic(code_name="", code="")
-            symbols = []
-            while rs.next():
-                row = rs.get_row_data()
-                code = row[0]           # "sh.600000" or "sz.000001"
-                status = row[4]         # "1" = 上市
-                stock_type = row[5]     # "1" = 股票
-                if status == "1" and stock_type == "1":
-                    symbols.append(code.split(".")[1])  # 提取纯数字代码
+            df = ak.stock_info_a_code_name()
+            symbols = [str(code).zfill(6) for code in df["code"].tolist()]
             logger.info(f"获取股票列表完成，共 {len(symbols)} 只")
             return symbols
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"获取股票列表失败: {e}")
             return []
-        finally:
-            bs.logout()
 
     def get_local_symbols(self) -> list[str]:
         with sqlite3.connect(self.db_path) as conn:
