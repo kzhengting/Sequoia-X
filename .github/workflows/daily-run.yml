@@ -17,17 +17,14 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
-
       - name: 安装 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
           pip install -e .
-
       - name: 恢复历史行情数据库缓存
         uses: actions/cache@v4
         with:
@@ -35,15 +32,24 @@ jobs:
           key: sequoia-db-${{ github.run_id }}
           restore-keys: |
             sequoia-db-
-
-      - name: 首次初始化（无历史库时回填）
+      - name: 首次初始化（无历史行情数据时回填，含重试）
         run: |
-          if [ ! -f data/sequoia_v2.db ]; then
-            echo "未发现历史数据库，执行全量回填..."
-            python main.py --backfill
+          count_rows() {
+            python -c "import sqlite3,os;p='data/sequoia_v2.db';print(int(sqlite3.connect(p).execute('select count(*) from stock_daily').fetchone()[0]) if os.path.exists(p) else 0)" 2>/dev/null || echo 0
+          }
+          if [ "$(count_rows)" -gt 0 ]; then
+            echo "已存在历史行情数据（$(count_rows) 行），跳过回填"
           else
-            echo "已存在历史数据库，跳过回填"
+            echo "本地无历史行情数据，执行全量回填（最多 3 次）..."
+            for i in 1 2 3; do
+              python main.py --backfill || true
+              if [ "$(count_rows)" -gt 0 ]; then
+                echo "回填成功，现有 $(count_rows) 行"
+                break
+              fi
+              echo "第 ${i} 次回填后仍无数据，10 秒后重试..."
+              sleep 10
+            done
           fi
-
       - name: 执行选股并推送飞书
         run: python main.py
