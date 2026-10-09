@@ -2,7 +2,7 @@
 
 两种运行模式：
   python main.py               # 日常模式：8进程增量补数据 + 跑策略 + 飞书推送（2~3分钟）
-  python main.py --backfill    # 回填模式：baostock 拉全市场历史K线（首次/补数据用，约12分钟）
+  python main.py --backfill    # 回填模式：AkShare 拉全市场历史K线（首次/补数据用，约12分钟）
 
 指定股票池：
   通过环境变量 STOCK_POOL 指定股票池（逗号/顿号/分号/空格分隔）。
@@ -76,7 +76,7 @@ def main() -> None:
     parser.add_argument(
         "--backfill",
         action="store_true",
-        help="回填模式：通过 baostock 拉取全市场历史 K 线（约12分钟）",
+        help="回填模式：通过 AkShare 拉取全市场历史 K 线（约12分钟）",
     )
     args = parser.parse_args()
 
