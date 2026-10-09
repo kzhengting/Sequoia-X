@@ -12,6 +12,34 @@ from sequoia_x.core.logger import get_logger
 logger = get_logger(__name__)
 
 
+# 全市场代码->名称映射缓存（首次请求后复用，避免重复拉取）
+_NAMES_CACHE: dict[str, str] | None = None
+
+
+def _load_name_map() -> dict[str, str]:
+    """加载并缓存全市场代码->名称映射。
+
+    仅在首次访问时请求 AkShare；失败时缓存空表以避免重复请求。
+    """
+    global _NAMES_CACHE
+    if _NAMES_CACHE is not None:
+        return _NAMES_CACHE
+
+    try:
+        import akshare as ak
+
+        df = ak.stock_info_a_code_name()
+        _NAMES_CACHE = {
+            str(code).zfill(6): str(name)
+            for code, name in zip(df["code"], df["name"])
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"获取股票名称失败：{exc}")
+        _NAMES_CACHE = {}
+
+    return _NAMES_CACHE
+
+
 class FeishuNotifier:
     """飞书 Webhook 推送器。
 
@@ -64,19 +92,9 @@ class FeishuNotifier:
 
     @staticmethod
     def _get_stock_names(symbols: list[str]) -> dict[str, str]:
-        """通过 baostock 批量查询股票名称，返回 {code: name} 映射。"""
-        import baostock as bs
-
-        bs.login()
-        mapping = {}
-        for code in symbols:
-            prefix = "sh" if code.startswith(("6", "9")) else "sz"
-            rs = bs.query_stock_basic(code=f"{prefix}.{code}")
-            while rs.next():
-                row = rs.get_row_data()
-                mapping[code] = row[1]  # 第2个字段是股票名称
-        bs.logout()
-        return mapping
+        """通过 AkShare 批量查询股票名称，返回 {code: name} 映射（结果缓存）。"""
+        name_map = _load_name_map()
+        return {code: name_map[code] for code in symbols if code in name_map}
 
     def _build_card(self, symbols: list[str], strategy_name: str) -> dict:
         today = date.today().strftime("%Y-%m-%d")
