@@ -98,7 +98,7 @@ def main() -> None:
         if args.backfill:
             # ── 回填模式：单线程保守拉历史 K 线，自动多轮重跑 ──
             logger.info("进入回填模式...")
-            all_symbols = engine.get_all_symbols()
+            all_symbols = engine.get_all_symbols() or sorted(stock_pool)
             engine.backfill(all_symbols)
             logger.info("Sequoia-X V2 回填模式运行完成")
             return
